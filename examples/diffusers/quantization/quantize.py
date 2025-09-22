@@ -33,6 +33,7 @@ from config import (
     set_quant_config_attr,
 )
 from diffusers import (
+    WanPipeline,
     DiffusionPipeline,
     FluxPipeline,
     LTXConditionPipeline,
@@ -52,6 +53,17 @@ from utils import (
 import modelopt.torch.opt as mto
 import modelopt.torch.quantization as mtq
 
+import contextlib
+@contextlib.contextmanager
+def patch_norm():
+    from diffusers.models.normalization import RMSNorm
+    old_norm = torch.nn.RMSNorm
+    torch.nn.RMSNorm = RMSNorm
+    try:
+        yield
+    finally:
+        torch.nn.RMSNorm = old_norm
+
 
 class ModelType(str, Enum):
     """Supported model types."""
@@ -62,6 +74,7 @@ class ModelType(str, Enum):
     FLUX_DEV = "flux-dev"
     FLUX_SCHNELL = "flux-schnell"
     LTX_VIDEO_DEV = "ltx-video-dev"
+    WAN = "wan"
 
 
 class DataType(str, Enum):
@@ -128,6 +141,7 @@ MODEL_REGISTRY: dict[ModelType, str] = {
     ModelType.FLUX_DEV: "black-forest-labs/FLUX.1-dev",
     ModelType.FLUX_SCHNELL: "black-forest-labs/FLUX.1-schnell",
     ModelType.LTX_VIDEO_DEV: "Lightricks/LTX-Video-0.9.7-dev",
+    ModelType.WAN: "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
 }
 
 # Model-specific default arguments for calibration
@@ -233,6 +247,7 @@ class ModelConfig:
             ModelType.FLUX_DEV,
             ModelType.FLUX_SCHNELL,
             ModelType.LTX_VIDEO_DEV,
+            ModelType.WAN,
         ]
 
 
@@ -323,22 +338,25 @@ class PipelineManager:
             ValueError: If model type is unsupported
         """
         try:
-            model_id = (
-                MODEL_REGISTRY[model_type] if override_model_path is None else override_model_path
-            )
-            if model_type == ModelType.SD3_MEDIUM:
-                pipe = StableDiffusion3Pipeline.from_pretrained(model_id, torch_dtype=torch_dtype)
-            elif model_type in [ModelType.FLUX_DEV, ModelType.FLUX_SCHNELL]:
-                pipe = FluxPipeline.from_pretrained(model_id, torch_dtype=torch_dtype)
-            else:
-                # SDXL models
-                pipe = DiffusionPipeline.from_pretrained(
-                    model_id,
-                    torch_dtype=torch_dtype,
-                    use_safetensors=True,
+            with patch_norm():
+                model_id = (
+                    MODEL_REGISTRY[model_type] if override_model_path is None else override_model_path
                 )
-            pipe.set_progress_bar_config(disable=True)
-            return pipe
+                if model_type == ModelType.SD3_MEDIUM:
+                    pipe = StableDiffusion3Pipeline.from_pretrained(model_id, torch_dtype=torch_dtype)
+                elif model_type in [ModelType.FLUX_DEV, ModelType.FLUX_SCHNELL]:
+                    pipe = FluxPipeline.from_pretrained(model_id, torch_dtype=torch_dtype)
+                elif model_type in [ModelType.WAN]:
+                        pipe = WanPipeline.from_pretrained(model_id, torch_dtype=torch_dtype)
+                else:
+                    # SDXL models
+                    pipe = DiffusionPipeline.from_pretrained(
+                        model_id,
+                        torch_dtype=torch_dtype,
+                        use_safetensors=True,
+                    )
+                pipe.set_progress_bar_config(disable=True)
+                return pipe
         except Exception as e:
             raise e
 
@@ -357,40 +375,43 @@ class PipelineManager:
         self.logger.info(f"Data type: {self.config.model_dtype.value}")
 
         try:
-            if self.config.model_type == ModelType.SD3_MEDIUM:
-                self.pipe = StableDiffusion3Pipeline.from_pretrained(
-                    self.config.model_path, torch_dtype=self.config.torch_dtype
-                )
-            elif self.config.model_type in [ModelType.FLUX_DEV, ModelType.FLUX_SCHNELL]:
-                self.pipe = FluxPipeline.from_pretrained(
-                    self.config.model_path, torch_dtype=self.config.torch_dtype
-                )
-            elif self.config.model_type == ModelType.LTX_VIDEO_DEV:
-                self.pipe = LTXConditionPipeline.from_pretrained(
-                    self.config.model_path, torch_dtype=self.config.torch_dtype
-                )
-                # Optionally load the upsampler pipeline for LTX-Video
-                if not self.config.ltx_skip_upsampler:
-                    self.logger.info("Loading LTX-Video upsampler pipeline...")
-                    self.pipe_upsample = LTXLatentUpsamplePipeline.from_pretrained(
-                        "Lightricks/ltxv-spatial-upscaler-0.9.7",
-                        vae=self.pipe.vae,
-                        torch_dtype=self.config.torch_dtype,
+            with patch_norm():
+                if self.config.model_type == ModelType.SD3_MEDIUM:
+                    self.pipe = StableDiffusion3Pipeline.from_pretrained(
+                        self.config.model_path, torch_dtype=self.config.torch_dtype
                     )
-                    self.pipe_upsample.set_progress_bar_config(disable=True)
+                elif self.config.model_type in [ModelType.FLUX_DEV, ModelType.FLUX_SCHNELL]:
+                    self.pipe = FluxPipeline.from_pretrained(
+                        self.config.model_path, torch_dtype=self.config.torch_dtype
+                    )
+                elif self.config.model_type == ModelType.LTX_VIDEO_DEV:
+                    self.pipe = LTXConditionPipeline.from_pretrained(
+                        self.config.model_path, torch_dtype=self.config.torch_dtype
+                    )
+                    # Optionally load the upsampler pipeline for LTX-Video
+                    if not self.config.ltx_skip_upsampler:
+                        self.logger.info("Loading LTX-Video upsampler pipeline...")
+                        self.pipe_upsample = LTXLatentUpsamplePipeline.from_pretrained(
+                            "Lightricks/ltxv-spatial-upscaler-0.9.7",
+                            vae=self.pipe.vae,
+                            torch_dtype=self.config.torch_dtype,
+                        )
+                        self.pipe_upsample.set_progress_bar_config(disable=True)
+                    else:
+                        self.logger.info("Skipping upsampler pipeline for faster calibration")
+                elif self.config.model_type == ModelType.WAN:
+                    self.pipe = WanPipeline.from_pretrained(self.config.model_path, torch_dtype=self.config.torch_dtype)
                 else:
-                    self.logger.info("Skipping upsampler pipeline for faster calibration")
-            else:
-                # SDXL models
-                self.pipe = DiffusionPipeline.from_pretrained(
-                    self.config.model_path,
-                    torch_dtype=self.config.torch_dtype,
-                    use_safetensors=True,
-                )
-            self.pipe.set_progress_bar_config(disable=True)
+                    # SDXL models
+                    self.pipe = DiffusionPipeline.from_pretrained(
+                        self.config.model_path,
+                        torch_dtype=self.config.torch_dtype,
+                        use_safetensors=True,
+                    )
+                self.pipe.set_progress_bar_config(disable=True)
 
-            self.logger.info("Pipeline created successfully")
-            return self.pipe
+                self.logger.info("Pipeline created successfully")
+                return self.pipe
 
         except Exception as e:
             self.logger.error(f"Failed to create pipeline: {e}")
@@ -492,7 +513,7 @@ class Calibrator:
                         "prompt": prompt_batch,
                         "num_inference_steps": self.config.n_steps,
                     }
-                    self.pipe(**common_args, **extra_args).images  # type: ignore[misc]
+                    self.pipe(**common_args, **extra_args)  #.images  # type: ignore[misc]
                 pbar.update(1)
                 self.logger.debug(f"Completed calibration batch {i + 1}/{self.config.num_batches}")
         self.logger.info("Calibration completed successfully")

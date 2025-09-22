@@ -40,6 +40,7 @@ import onnx_graphsurgeon as gs
 import torch
 from diffusers.models.transformers import FluxTransformer2DModel, SD3Transformer2DModel
 from diffusers.models.transformers.transformer_ltx import LTXVideoTransformer3DModel
+from diffusers.models.transformers.transformer_wan import WanTransformer3DModel
 from diffusers.models.unets import UNet2DConditionModel
 from torch.onnx import export as onnx_export
 
@@ -97,6 +98,11 @@ MODEL_ID_TO_DYNAMIC_AXES = {
         "encoder_attention_mask": {0: "batch_size"},
         "video_coords": {0: "batch_size", 2: "latent_dim"},
     },
+    "wan": {
+        "hidden_states": {0: "batch_size", 3: "height", 4: "width"},
+        "timestep": {0: "batch_size"},
+        "encoder_hidden_states": {0: "batch_size"},
+    }
 }
 
 
@@ -280,6 +286,32 @@ def _gen_dummy_inp_and_dyn_shapes_ltx(backbone, min_bs=2, opt_bs=2):
     }
     return dummy_input, dynamic_shapes
 
+def _gen_dummy_inp_and_dyn_shapes_wan(backbone, min_bs=1, opt_bs=1):
+    assert isinstance(backbone, WanTransformer3DModel)
+    cfg = backbone.config
+    dtype = backbone.dtype
+
+    num_channels, num_frames, height, width = cfg.in_channels, 31, 88, 160
+    dynamic_shapes = {
+        "hidden_states": {
+            "min": [min_bs, num_channels, num_frames, height, width],
+            "opt": [opt_bs, num_channels, num_frames, height, width],
+        },
+        "timestep": {"min": [min_bs], "opt": [opt_bs]},
+        "encoder_hidden_states": {
+            "min": [min_bs, 512, 4096],
+            "opt": [opt_bs, 512, 4096],
+        }
+    }
+    dummy_input = {
+        "hidden_states": torch.randn(*dynamic_shapes["hidden_states"]["min"], dtype=dtype),
+        "encoder_hidden_states": torch.randn(
+            *dynamic_shapes["encoder_hidden_states"]["min"], dtype=dtype
+        ),
+        "timestep": torch.ones(*dynamic_shapes["timestep"]["min"], dtype=dtype),
+    }
+    return dummy_input, dynamic_shapes
+
 
 def update_dynamic_axes(model_id, dynamic_axes):
     if model_id in ["flux-dev", "flux-schnell"]:
@@ -290,6 +322,10 @@ def update_dynamic_axes(model_id, dynamic_axes):
         dynamic_axes["out.0"] = dynamic_axes.pop("latent")
     elif model_id == "sd3-medium":
         dynamic_axes["out.0"] = dynamic_axes.pop("sample")
+    elif model_id == "wan":
+        pass
+    else:
+        raise NotImplementedError("Unknown model")
 
 
 def _create_dynamic_shapes(dynamic_shapes):
@@ -324,6 +360,10 @@ def generate_dummy_inputs_and_dynamic_axes_and_shapes(model_id, backbone):
     elif model_id == "ltx-video-dev":
         dummy_input, dynamic_shapes = _gen_dummy_inp_and_dyn_shapes_ltx(
             backbone, min_bs=2, opt_bs=2
+        )
+    elif model_id == "wan":
+        dummy_input, dynamic_shapes = _gen_dummy_inp_and_dyn_shapes_wan(
+            backbone, min_bs=1, opt_bs=1
         )
     else:
         raise NotImplementedError(f"Unsupported model_id: {model_id}")
@@ -425,6 +465,13 @@ def modelopt_export_sd(backbone, onnx_dir, model_name, precision):
             "timestep",
             "encoder_attention_mask",
             "video_coords",
+        ]
+        output_names = ["latent"]
+    elif model_name == "wan":
+        input_names = [
+            "hidden_states",
+            "timestep",
+            "encoder_hidden_states",
         ]
         output_names = ["latent"]
     else:
