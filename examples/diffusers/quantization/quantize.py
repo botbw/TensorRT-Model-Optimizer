@@ -37,9 +37,13 @@ from diffusers import (
     DiffusionPipeline,
     FluxPipeline,
     LTXConditionPipeline,
-    LTXLatentUpsamplePipeline,
     StableDiffusion3Pipeline,
 )
+try:
+    from diffusers import LTXLatentUpsamplePipeline
+except ImportError:
+    LTXLatentUpsamplePipeline = None
+
 from onnx_utils.export import generate_fp8_scales, modelopt_export_sd
 from tqdm import tqdm
 from utils import (
