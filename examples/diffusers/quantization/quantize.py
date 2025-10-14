@@ -45,6 +45,8 @@ try:
 except ImportError:
     LTXLatentUpsamplePipeline = None
 from diffusers.utils import export_to_video
+from diffusers import __version__ as diffuser_version
+WAN22_VERSION = "0.35.0"
 
 from onnx_utils.export import generate_fp8_scales, modelopt_export_sd
 from tqdm import tqdm
@@ -456,6 +458,8 @@ class PipelineManager:
             raise RuntimeError("Pipeline not created. Call create_pipeline() first.")
 
         if self.config.uses_transformer:
+            if self.config.model_type == ModelType.WAN and diffuser_version >= WAN22_VERSION:  # Wan2.2
+                return torch.nn.ModuleList([self.pipe.transformer, self.pipe.transformer_2])
             return self.pipe.transformer
         return self.pipe.unet
 
@@ -971,7 +975,11 @@ def main() -> None:
 
             def forward_loop(mod):
                 if model_config.uses_transformer:
-                    pipe.transformer = mod
+                    if model_config.model_type == ModelType.WAN and diffuser_version >= WAN22_VERSION:
+                        pipe.transformer = mod[0]
+                        pipe.transformer_2 = mod[1]
+                    else:
+                        pipe.transformer = mod
                 else:
                     pipe.unet = mod
                 calibrator.run_calibration(prompts)
