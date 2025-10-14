@@ -16,6 +16,7 @@
 import argparse
 import logging
 import sys
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -43,6 +44,7 @@ try:
     from diffusers import LTXLatentUpsamplePipeline
 except ImportError:
     LTXLatentUpsamplePipeline = None
+from diffusers.utils import export_to_video
 
 from onnx_utils.export import generate_fp8_scales, modelopt_export_sd
 from tqdm import tqdm
@@ -504,6 +506,14 @@ class Calibrator:
         self.logger.info(f"Starting calibration with {self.config.num_batches} batches")
         extra_args = MODEL_DEFAULTS.get(self.model_type, {})
 
+        os.makedirs("output", exist_ok=True)
+
+        with open("output/calibration_prompts.txt", "w") as f:
+            for i, prompt in enumerate(prompts):
+                if i >= self.config.num_batches:
+                    break
+                f.write(f"{i}. {prompt}\n")
+
         with tqdm(total=self.config.num_batches, desc="Calibration", unit="batch") as pbar:
             for i, prompt_batch in enumerate(prompts):
                 if i >= self.config.num_batches:
@@ -512,12 +522,22 @@ class Calibrator:
                 if self.model_type == ModelType.LTX_VIDEO_DEV:
                     # Special handling for LTX-Video
                     self._run_ltx_video_calibration(prompt_batch, extra_args)  # type: ignore[arg-type]
+                elif self.model_type == ModelType.WAN:
+                    common_args = {
+                        "prompt": prompt_batch,
+                        "num_inference_steps": self.config.n_steps,
+                        "height": 256,
+                        "width": 256,
+                        "num_frames": 5,
+                    }
+                    output = self.pipe(**common_args, **extra_args).frames[0]
+                    export_to_video(output, f"output/{i}.mp4", fps=24)
                 else:
                     common_args = {
                         "prompt": prompt_batch,
                         "num_inference_steps": self.config.n_steps,
                     }
-                    self.pipe(**common_args, **extra_args)  #.images  # type: ignore[misc]
+                    self.pipe(**common_args, **extra_args).images  # type: ignore[misc]
                 pbar.update(1)
                 self.logger.debug(f"Completed calibration batch {i + 1}/{self.config.num_batches}")
         self.logger.info("Calibration completed successfully")
