@@ -28,6 +28,8 @@ import torch
 import torch.nn as nn
 from safetensors.torch import save_file
 
+from diffusers import DiffusionPipeline
+
 from modelopt.torch.quantization import set_quantizer_by_cfg_context
 from modelopt.torch.quantization.nn import SequentialQuantizer, TensorQuantizer
 from modelopt.torch.quantization.qtensor import NVFP4QTensor
@@ -69,9 +71,9 @@ from .quant_utils import (
     to_quantized_weight,
 )
 
-__all__ = ["export_hf_checkpoint"]
+__all__ = ["export_hf_checkpoint", "export_diffuser_checkpoint"]
 
-SPECULATIVE_DECODING_MODULE_NAMES = ["medusa_heads", "eagle_module", "drafter"]
+SPECULATIVE_DECODING_MODULE_NAMES = ["medusa_heads", "eagle_module", "drafter"] 
 
 
 def _is_enabled_quantizer(quantizer):
@@ -545,6 +547,238 @@ def export_hf_checkpoint(
 
         with open(original_config, "w") as file:
             json.dump(config_data, file, indent=4)
+
+    except Exception as e:
+        warnings.warn(
+            "Cannot export model to the model_config. The modelopt-optimized model state_dict"
+            " can be saved with torch.save for further inspection."
+        )
+        raise e
+
+
+def requantize_resmooth_fused_diffuser_layers(pipe: DiffusionPipeline):
+    """Group modules that take the same input and register shared parameters in module."""
+    # TODO: Handle DBRX MoE
+    input_to_linear = defaultdict(list)
+    output_to_layernorm = defaultdict(None)
+    quantization_format = get_quantization_format(pipe.transformer)
+
+    def _input_hook(module, input, output):
+        """Update dictionary with list of all modules that share the same input."""
+        # TODO: Handle DBRX MoE case
+        input_to_linear[input[0]].append(module)
+
+    def _output_hook(module, input, output):
+        """Update dictionary with mapping of layernorms and their outputs."""
+        output_to_layernorm[output] = module
+
+    handles = []
+
+    fused_linears = {}
+    module_names = set()
+
+    for transformer_name, model in zip(["transformer", "transformer_2"], [pipe.transformer, pipe.transformer_2]):
+        for name, module in model.named_modules():
+            name = f"{transformer_name}.{name}"
+            module_names.add(name)
+
+            # # For MoE models update pre_quant_scale to average pre_quant_scale amongst experts
+            # if is_moe(module) and ("awq" in quantization_format):
+            #     # update_experts_avg_prequant_scale(module)
+            #     grouped_experts = get_experts_list(module, model_type)
+            #     for modules in grouped_experts:
+            #         preprocess_linear_fusion(modules, resmooth_only=True)
+
+            # Attach hook to layernorm modules that need to be fused
+            if is_layernorm(module):
+                module.name = name
+                handle = module.register_forward_hook(_output_hook)
+                handles.append(handle)
+            elif is_quantlinear(module) and (
+                _is_enabled_quantizer(module.input_quantizer)
+                or _is_enabled_quantizer(module.weight_quantizer)
+            ):
+                module.name = name
+                handle = module.register_forward_hook(_input_hook)
+                handles.append(handle)
+
+    with torch.no_grad():
+        fake_prompt = "realistic car 3 d render sci - fi car and sci - fi robotic factory structure in the coronation of napoleon painting and digital billboard with point cloud in the middle, unreal engine 5, keyshot, octane, artstation trending, ultra high detail, ultra realistic, cinematic, 8 k, 1 6 k, in style of zaha hadid, in style of nanospace michael menzelincev, in style of lee souder, in plastic, dark atmosphere, tilt shift, depth of field"
+
+        with set_quantizer_by_cfg_context(model, {"*": {"enable": False}}):
+                pipe(
+                    prompt=fake_prompt,
+                    num_inference_steps=50,
+                    height=256,
+                    width=256,
+                    num_frames=5
+                )
+
+        for handle in handles:
+            handle.remove()
+
+    for tensor, modules in input_to_linear.items():
+        quantization_format = get_quantization_format(modules[0])
+        if len(modules) > 1 and quantization_format not in [
+            QUANTIZATION_FP8,
+            QUANTIZATION_NONE,
+            QUANTIZATION_FP8_PB_REAL,
+        ]:
+            # Fuse modules that have the same input
+            preprocess_linear_fusion(modules)
+            fused_linears[modules[0].name] = [module.name for module in modules]
+
+        # Fuse layernorms
+        if (
+            quantization_format is not QUANTIZATION_NONE
+            and "awq" in quantization_format
+            and tensor in output_to_layernorm
+        ):
+            # Pre quant scale of modules is already updated to avg_pre_quant_scale
+            fuse_prequant_layernorm(output_to_layernorm[tensor], modules)
+
+    # The dummy forward may not be able to activate all the experts.
+    # Process experts by naming rules like experts.0, experts.1, etc.
+    for name, modules_fused in fused_linears.items():
+        if re.search(r"experts?\.\d+", name):
+            expert_id = 0
+            while True:
+                new_expert_name = re.sub(r"(experts?\.)\d+", rf"\g<1>{expert_id}", name, count=1)
+                if new_expert_name in fused_linears:
+                    expert_id += 1
+                    continue
+                if new_expert_name not in module_names:
+                    break
+
+                new_expert_modules = []
+                for name_fused in modules_fused:
+                    new_expert_name = re.sub(r"(experts?\.)\d+", rf"\g<1>{expert_id}", name_fused)
+                    assert new_expert_name in module_names
+                    new_expert_modules.append(model.get_submodule(new_expert_name))
+
+                preprocess_linear_fusion(new_expert_modules)
+
+                expert_id += 1
+
+
+
+
+def _export_diffuser_checkpoint(
+    pipe: DiffusionPipeline, dtype: torch.dtype
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Exports the torch model to the packed checkpoint with original HF naming.
+
+    The packed checkpoint will be consumed by the TensorRT-LLM unified converter.
+
+    Args:
+        model: the torch model.
+        dtype: the weights data type to export the unquantized layers or the default model data type if None.
+
+    Returns:
+        post_state_dict: Dict containing quantized weights
+        quant_config: config information to export hf_quant_cfg.json
+    """
+
+    layer_pool  = {
+        **{f"transformer.{k}": v for k, v in pipe.transformer.named_modules()},
+        **{f"transformer_2.{k}": v for k, v in pipe.transformer_2.named_modules()},
+    }
+
+    # Resmooth and requantize fused layers
+    # TODO: Handle mixed precision
+    requantize_resmooth_fused_diffuser_layers(pipe)
+
+    # Remove all hooks from the model
+    try:
+        from accelerate.hooks import remove_hook_from_module
+
+        remove_hook_from_module(pipe.transformer, recurse=True)
+        remove_hook_from_module(pipe.transformer_2, recurse=True)
+    except ImportError:
+        warnings.warn("accelerate is not installed, hooks will not be removed")
+
+    quant_config = get_quant_config(layer_pool)
+
+    kv_cache_max_bound = 0
+    kv_cache_format = quant_config["quantization"]["kv_cache_quant_algo"]
+
+    cache_bound_mapping = {
+        KV_CACHE_NVFP4: 6 * 448,
+        KV_CACHE_NVFP4_AFFINE: 6 * 448,
+        KV_CACHE_FP8: 448,
+    }
+
+    # Only update kv_cache_max_bound if a quantization is applied.
+    if kv_cache_format != QUANTIZATION_NONE:
+        kv_cache_max_bound = cache_bound_mapping.get(kv_cache_format)
+
+    # Track if any layers are quantized to properly set exclude_modules
+    has_quantized_layers = False
+
+    for name, sub_module in layer_pool.items():
+        if get_quantization_format(sub_module) != QUANTIZATION_NONE:
+            has_quantized_layers = True
+            if is_quantlinear(sub_module):
+                _export_quantized_weight(sub_module, dtype)
+
+    quantized_state_dict = {
+        **{f"transformer.{k}": v for k, v in pipe.transformer.state_dict().items()},
+        **{f"transformer_2.{k}": v for k, v in pipe.transformer_2.state_dict().items()},
+    }
+
+    quantized_state_dict = postprocess_state_dict(
+        quantized_state_dict, kv_cache_max_bound, kv_cache_format
+    )
+
+    # Check if any layers are quantized
+    if has_quantized_layers:
+        quant_config["quantization"].setdefault("exclude_modules", []).append("lm_head")
+
+    return quantized_state_dict, quant_config
+
+
+def export_diffuser_checkpoint(
+    pipe: DiffusionPipeline,
+    dtype: torch.dtype | None = None,
+    export_dir: Path | str = tempfile.gettempdir(),
+    save_modelopt_state: bool = False,
+):
+    """Exports the torch model to unified checkpoint and saves to export_dir.
+
+    Args:
+        model: the torch model.
+        dtype: the weights data type to export the unquantized layers or the default model data type if None.
+        export_dir: the target export path.
+        save_modelopt_state: whether to save the modelopt state_dict.
+    """
+    export_dir = Path(export_dir)
+    export_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        post_state_dict, hf_quant_config = _export_diffuser_checkpoint(pipe, dtype)
+
+        # Save hf_quant_config.json for backward compatibility
+        with open(f"{export_dir}/hf_quant_config.json", "w") as file:
+            json.dump(hf_quant_config, file, indent=4)
+
+        hf_quant_config = convert_hf_quant_config_format(hf_quant_config)
+
+        # Save model
+        pipe.save_pretrained(
+            export_dir, state_dict=post_state_dict, save_modelopt_state=save_modelopt_state
+        )
+
+        for key in ['transformer', 'transformer_2']:
+            original_config = f"{export_dir}/{key}/config.json"
+            config_data = {}
+
+            with open(original_config) as file:
+                config_data = json.load(file)
+
+            config_data["quantization_config"] = hf_quant_config
+
+            with open(original_config, "w") as file:
+                json.dump(config_data, file, indent=4)
 
     except Exception as e:
         warnings.warn(

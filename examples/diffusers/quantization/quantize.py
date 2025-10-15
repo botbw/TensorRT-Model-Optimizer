@@ -57,6 +57,7 @@ from utils import (
     filter_func_ltx_video,
     load_calib_prompts,
 )
+from modelopt.torch.export import export_diffuser_checkpoint
 
 import modelopt.torch.opt as mto
 import modelopt.torch.quantization as mtq
@@ -409,6 +410,8 @@ class PipelineManager:
                         self.logger.info("Skipping upsampler pipeline for faster calibration")
                 elif self.config.model_type == ModelType.WAN:
                     self.pipe = WanPipeline.from_pretrained(self.config.model_path, torch_dtype=self.config.torch_dtype)
+                    self.pipe.transformer.blocks = self.pipe.transformer.blocks[:1]
+                    self.pipe.transformer_2.blocks = self.pipe.transformer_2.blocks[:1]
                 else:
                     # SDXL models
                     self.pipe = DiffusionPipeline.from_pretrained(
@@ -535,6 +538,7 @@ class Calibrator:
                         "num_frames": 5,
                     }
                     output = self.pipe(**common_args, **extra_args).frames[0]
+                    print(f"Saving output {i}")
                     export_to_video(output, f"output/{i}.mp4", fps=24)
                 else:
                     common_args = {
@@ -885,13 +889,18 @@ def create_argument_parser() -> argparse.ArgumentParser:
     calib_group.add_argument(
         "--calib-size", type=int, default=128, help="Total number of calibration samples"
     )
-    calib_group.add_argument("--n-steps", type=int, default=30, help="Number of denoising steps")
+    calib_group.add_argument("--n-steps", type=int, default=50, help="Number of denoising steps")
 
     export_group = parser.add_argument_group("Export Configuration")
     export_group.add_argument(
         "--quantized-torch-ckpt-save-path",
         type=str,
         help="Path to save quantized PyTorch checkpoint",
+    )
+    export_group.add_argument(
+        "--quantized-hf-ckpt-save-path",
+        type=str,
+        default=None,
     )
     export_group.add_argument("--onnx-dir", type=str, help="Directory for ONNX export")
     export_group.add_argument(
@@ -916,89 +925,87 @@ def main() -> None:
     logger = setup_logging(args.verbose)
     logger.info("Starting Enhanced Diffusion Model Quantization")
 
-    try:
-        model_config = ModelConfig(
-            model_type=ModelType(args.model),
-            model_dtype=DataType(args.model_dtype),
-            trt_high_precision_dtype=DataType(args.trt_high_precision_dtype),
-            override_model_path=Path(args.override_model_path)
-            if args.override_model_path
-            else None,
-            cpu_offloading=args.cpu_offloading,
-            ltx_skip_upsampler=args.ltx_skip_upsampler,
-        )
+    model_config = ModelConfig(
+        model_type=ModelType(args.model),
+        model_dtype=DataType(args.model_dtype),
+        trt_high_precision_dtype=DataType(args.trt_high_precision_dtype),
+        override_model_path=Path(args.override_model_path)
+        if args.override_model_path
+        else None,
+        cpu_offloading=args.cpu_offloading,
+        ltx_skip_upsampler=args.ltx_skip_upsampler,
+    )
 
-        quant_config = QuantizationConfig(
-            format=QuantFormat(args.format),
-            algo=QuantAlgo(args.quant_algo),
-            percentile=args.percentile,
-            collect_method=CollectMethod(args.collect_method),
-            alpha=args.alpha,
-            lowrank=args.lowrank,
-            quantize_mha=args.quantize_mha,
-        )
+    quant_config = QuantizationConfig(
+        format=QuantFormat(args.format),
+        algo=QuantAlgo(args.quant_algo),
+        percentile=args.percentile,
+        collect_method=CollectMethod(args.collect_method),
+        alpha=args.alpha,
+        lowrank=args.lowrank,
+        quantize_mha=args.quantize_mha,
+    )
 
-        calib_config = CalibrationConfig(
-            batch_size=args.batch_size, calib_size=args.calib_size, n_steps=args.n_steps
-        )
+    calib_config = CalibrationConfig(
+        batch_size=args.batch_size, calib_size=args.calib_size, n_steps=args.n_steps
+    )
 
-        export_config = ExportConfig(
-            quantized_torch_ckpt_path=Path(args.quantized_torch_ckpt_save_path)
-            if args.quantized_torch_ckpt_save_path
-            else None,
-            onnx_dir=Path(args.onnx_dir) if args.onnx_dir else None,
-            restore_from=Path(args.restore_from) if args.restore_from else None,
-        )
+    export_config = ExportConfig(
+        quantized_torch_ckpt_path=Path(args.quantized_torch_ckpt_save_path)
+        if args.quantized_torch_ckpt_save_path
+        else None,
+        onnx_dir=Path(args.onnx_dir) if args.onnx_dir else None,
+        restore_from=Path(args.restore_from) if args.restore_from else None,
+    )
 
-        logger.info("Validating configurations...")
-        quant_config.validate()
-        export_config.validate()
-        if not export_config.restore_from:
-            calib_config.validate()
+    logger.info("Validating configurations...")
+    quant_config.validate()
+    export_config.validate()
+    if not export_config.restore_from:
+        calib_config.validate()
 
-        pipeline_manager = PipelineManager(model_config, logger)
-        pipe = pipeline_manager.create_pipeline()
-        pipeline_manager.setup_device()
+    pipeline_manager = PipelineManager(model_config, logger)
+    pipe = pipeline_manager.create_pipeline()
+    pipeline_manager.setup_device()
 
-        backbone = pipeline_manager.get_backbone()
-        export_manager = ExportManager(export_config, logger)
+    backbone = pipeline_manager.get_backbone()
+    export_manager = ExportManager(export_config, logger)
 
-        if export_config.restore_from:
-            export_manager.restore_checkpoint(backbone)
-        else:
-            logger.info("Initializing calibration...")
-            calibrator = Calibrator(pipeline_manager, calib_config, model_config.model_type, logger)
-            prompts = calibrator.load_prompts()
+    if export_config.restore_from:
+        export_manager.restore_checkpoint(backbone)
+    else:
+        logger.info("Initializing calibration...")
+        calibrator = Calibrator(pipeline_manager, calib_config, model_config.model_type, logger)
+        prompts = calibrator.load_prompts()
 
-            quantizer = Quantizer(quant_config, model_config, logger)
-            backbone_quant_config = quantizer.get_quant_config(calib_config.n_steps, backbone)
+        quantizer = Quantizer(quant_config, model_config, logger)
+        backbone_quant_config = quantizer.get_quant_config(calib_config.n_steps, backbone)
 
-            def forward_loop(mod):
-                if model_config.uses_transformer:
-                    if model_config.model_type == ModelType.WAN and diffuser_version >= WAN22_VERSION:
-                        pipe.transformer = mod[0]
-                        pipe.transformer_2 = mod[1]
-                    else:
-                        pipe.transformer = mod
+        def forward_loop(mod):
+            if model_config.uses_transformer:
+                if model_config.model_type == ModelType.WAN and diffuser_version >= WAN22_VERSION:
+                    pipe.transformer = mod[0]
+                    pipe.transformer_2 = mod[1]
                 else:
-                    pipe.unet = mod
-                calibrator.run_calibration(prompts)
+                    pipe.transformer = mod
+            else:
+                pipe.unet = mod
+            calibrator.run_calibration(prompts)
 
-            quantizer.quantize_model(backbone, backbone_quant_config, forward_loop)
-
+        quantizer.quantize_model(backbone, backbone_quant_config, forward_loop)
+    if args.quantized_hf_ckpt_save_path is not None:
+        export_diffuser_checkpoint(pipe, torch.half, args.quantized_hf_ckpt_save_path)
+    else:
         export_manager.save_checkpoint(backbone)
-        export_manager.export_onnx(
-            pipe,
-            backbone,
-            model_config.model_type,
-            quant_config.format,
-            quantize_mha=QuantizationConfig.quantize_mha,
-        )
-        logger.info("Quantization process completed successfully!")
+    export_manager.export_onnx(
+        pipe,
+        backbone,
+        model_config.model_type,
+        quant_config.format,
+        quantize_mha=QuantizationConfig.quantize_mha,
+    )
+    logger.info("Quantization process completed successfully!")
 
-    except Exception as e:
-        logger.error(f"Quantization failed: {e}", exc_info=True)
-        sys.exit(1)
 
 
 if __name__ == "__main__":
