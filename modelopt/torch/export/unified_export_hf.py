@@ -556,7 +556,7 @@ def export_hf_checkpoint(
         raise e
 
 
-def requantize_resmooth_fused_diffuser_layers(pipe: DiffusionPipeline):
+def requantize_resmooth_fused_diffuser_layers(pipe: DiffusionPipeline, is_wan22: bool):
     """Group modules that take the same input and register shared parameters in module."""
     # TODO: Handle DBRX MoE
     input_to_linear = defaultdict(list)
@@ -577,9 +577,16 @@ def requantize_resmooth_fused_diffuser_layers(pipe: DiffusionPipeline):
     fused_linears = {}
     module_names = set()
 
-    for transformer_name, model in zip(["transformer", "transformer_2"], [pipe.transformer, pipe.transformer_2]):
+    if is_wan22:
+        transformer_keys = ["transformer", "transformer_2"]
+        transformer_modules = [pipe.transformer, pipe.transformer_2]
+    else:
+        transformer_keys = ["transformer"]
+        transformer_modules = [pipe.transformer]
+
+    for base_name, model in zip(transformer_keys, transformer_modules):
         for name, module in model.named_modules():
-            name = f"{transformer_name}.{name}"
+            name = f"{base_name}.{name}"
             module_names.add(name)
 
             # # For MoE models update pre_quant_scale to average pre_quant_scale amongst experts
@@ -664,7 +671,7 @@ def requantize_resmooth_fused_diffuser_layers(pipe: DiffusionPipeline):
 
 
 def _export_diffuser_checkpoint(
-    pipe: DiffusionPipeline, dtype: torch.dtype
+    pipe: DiffusionPipeline, dtype: torch.dtype, is_wan22: bool
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Exports the torch model to the packed checkpoint with original HF naming.
 
@@ -679,10 +686,15 @@ def _export_diffuser_checkpoint(
         quant_config: config information to export hf_quant_cfg.json
     """
 
-    layer_pool  = {
-        **{f"transformer.{k}": v for k, v in pipe.transformer.named_modules()},
-        **{f"transformer_2.{k}": v for k, v in pipe.transformer_2.named_modules()},
-    }
+    if is_wan22:
+        layer_pool  = {
+            **{f"transformer.{k}": v for k, v in pipe.transformer.named_modules()},
+            **{f"transformer_2.{k}": v for k, v in pipe.transformer_2.named_modules()},
+        }
+    else:
+        layer_pool  = { 
+            **{f"transformer.{k}": v for k, v in pipe.transformer.named_modules()}, 
+        }
 
     # Resmooth and requantize fused layers
     # TODO: Handle mixed precision
@@ -721,10 +733,15 @@ def _export_diffuser_checkpoint(
             if is_quantlinear(sub_module):
                 _export_quantized_weight(sub_module, dtype)
 
-    quantized_state_dict = {
-        **{f"transformer.{k}": v for k, v in pipe.transformer.state_dict().items()},
-        **{f"transformer_2.{k}": v for k, v in pipe.transformer_2.state_dict().items()},
-    }
+    if is_wan22:
+        quantized_state_dict = {
+            **{f"transformer.{k}": v for k, v in pipe.transformer.state_dict().items()},
+            **{f"transformer_2.{k}": v for k, v in pipe.transformer_2.state_dict().items()},
+        }
+    else:
+        quantized_state_dict = {
+            **{f"transformer.{k}": v for k, v in pipe.transformer.state_dict().items()},
+        }
 
     quantized_state_dict = postprocess_state_dict(
         quantized_state_dict, kv_cache_max_bound, kv_cache_format
@@ -742,6 +759,7 @@ def export_diffuser_checkpoint(
     dtype: torch.dtype | None = None,
     export_dir: Path | str = tempfile.gettempdir(),
     save_modelopt_state: bool = False,
+    is_wan22: bool = False
 ):
     """Exports the torch model to unified checkpoint and saves to export_dir.
 
@@ -755,7 +773,7 @@ def export_diffuser_checkpoint(
     export_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        post_state_dict, hf_quant_config = _export_diffuser_checkpoint(pipe, dtype)
+        post_state_dict, hf_quant_config = _export_diffuser_checkpoint(pipe, dtype, is_wan22=is_wan22)
 
         # Save hf_quant_config.json for backward compatibility
         with open(f"{export_dir}/hf_quant_config.json", "w") as file:
@@ -768,7 +786,8 @@ def export_diffuser_checkpoint(
             export_dir, state_dict=post_state_dict, save_modelopt_state=save_modelopt_state
         )
 
-        for key in ['transformer', 'transformer_2']:
+        transformer_keys = ["transformer", "transformer_2"] if is_wan22 else ["transformer"]
+        for key in transformer_keys:
             original_config = f"{export_dir}/{key}/config.json"
             config_data = {}
 

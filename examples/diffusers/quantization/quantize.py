@@ -410,8 +410,8 @@ class PipelineManager:
                         self.logger.info("Skipping upsampler pipeline for faster calibration")
                 elif self.config.model_type == ModelType.WAN:
                     self.pipe = WanPipeline.from_pretrained(self.config.model_path, torch_dtype=self.config.torch_dtype)
-                    self.pipe.transformer.blocks = self.pipe.transformer.blocks[:1]
-                    self.pipe.transformer_2.blocks = self.pipe.transformer_2.blocks[:1]
+                    # self.pipe.transformer.blocks = self.pipe.transformer.blocks[:1]
+                    # self.pipe.transformer_2.blocks = self.pipe.transformer_2.blocks[:1]
                 else:
                     # SDXL models
                     self.pipe = DiffusionPipeline.from_pretrained(
@@ -994,7 +994,7 @@ def main() -> None:
 
         quantizer.quantize_model(backbone, backbone_quant_config, forward_loop)
     if args.quantized_hf_ckpt_save_path is not None:
-        export_diffuser_checkpoint(pipe, torch.half, args.quantized_hf_ckpt_save_path)
+        export_diffuser_checkpoint(pipe, torch.half, args.quantized_hf_ckpt_save_path, is_wan22=(model_config.model_type==ModelType.WAN and diffuser_version >= WAN22_VERSION))
     else:
         export_manager.save_checkpoint(backbone)
     export_manager.export_onnx(
