@@ -612,13 +612,21 @@ def requantize_resmooth_fused_diffuser_layers(pipe: DiffusionPipeline, is_wan22:
     with torch.no_grad():
         fake_prompt = "realistic car 3 d render sci - fi car and sci - fi robotic factory structure in the coronation of napoleon painting and digital billboard with point cloud in the middle, unreal engine 5, keyshot, octane, artstation trending, ultra high detail, ultra realistic, cinematic, 8 k, 1 6 k, in style of zaha hadid, in style of nanospace michael menzelincev, in style of lee souder, in plastic, dark atmosphere, tilt shift, depth of field"
 
-        with set_quantizer_by_cfg_context(model, {"*": {"enable": False}}):
+
+        if is_wan22:
+            with set_quantizer_by_cfg_context(transformer_modules[0], {"*": {"enable": False}}), set_quantizer_by_cfg_context(transformer_modules[1], {"*": {"enable": False}}):
                 pipe(
                     prompt=fake_prompt,
-                    num_inference_steps=50,
-                    height=256,
-                    width=256,
-                    num_frames=5
+                    # num_inference_steps=50,
+                    # height=256,
+                    # width=256,
+                    # num_frames=5
+                )
+        else:
+            with set_quantizer_by_cfg_context(transformer_modules[0], {"*": {"enable": False}}):
+                pipe(
+                    prompt=fake_prompt,
+                    # num_inference_steps=28,
                 )
 
         for handle in handles:
