@@ -533,9 +533,9 @@ class Calibrator:
                     common_args = {
                         "prompt": prompt_batch,
                         "num_inference_steps": self.config.n_steps,
-                        "height": 256,
-                        "width": 256,
-                        "num_frames": 5,
+                        # "height": 256,
+                        # "width": 256,
+                        # "num_frames": 5,
                     }
                     output = self.pipe(**common_args, **extra_args).frames[0]
                     print(f"Saving output {i}")
