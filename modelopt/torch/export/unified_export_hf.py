@@ -698,7 +698,7 @@ def _export_diffuser_checkpoint(
 
     # Resmooth and requantize fused layers
     # TODO: Handle mixed precision
-    requantize_resmooth_fused_diffuser_layers(pipe)
+    requantize_resmooth_fused_diffuser_layers(pipe, is_wan22=is_wan22)
 
     # Remove all hooks from the model
     try:
