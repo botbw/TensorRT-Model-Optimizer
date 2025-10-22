@@ -545,7 +545,8 @@ class Calibrator:
                         "prompt": prompt_batch,
                         "num_inference_steps": self.config.n_steps,
                     }
-                    self.pipe(**common_args, **extra_args).images  # type: ignore[misc]
+                    images = self.pipe(**common_args, **extra_args).images  # type: ignore[misc]
+                    images[0].save(f"output/{i}.png")
                 pbar.update(1)
                 self.logger.debug(f"Completed calibration batch {i + 1}/{self.config.num_batches}")
         self.logger.info("Calibration completed successfully")
