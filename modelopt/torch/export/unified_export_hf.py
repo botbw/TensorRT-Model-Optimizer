@@ -617,7 +617,7 @@ def requantize_resmooth_fused_diffuser_layers(pipe: DiffusionPipeline, is_wan22:
             with set_quantizer_by_cfg_context(transformer_modules[0], {"*": {"enable": False}}), set_quantizer_by_cfg_context(transformer_modules[1], {"*": {"enable": False}}):
                 pipe(
                     prompt=fake_prompt,
-                    # num_inference_steps=50,
+                    num_inference_steps=1,
                     # height=256,
                     # width=256,
                     # num_frames=5
@@ -626,7 +626,7 @@ def requantize_resmooth_fused_diffuser_layers(pipe: DiffusionPipeline, is_wan22:
             with set_quantizer_by_cfg_context(transformer_modules[0], {"*": {"enable": False}}):
                 pipe(
                     prompt=fake_prompt,
-                    # num_inference_steps=28,
+                    num_inference_steps=1,
                 )
 
         for handle in handles:
@@ -713,7 +713,8 @@ def _export_diffuser_checkpoint(
         from accelerate.hooks import remove_hook_from_module
 
         remove_hook_from_module(pipe.transformer, recurse=True)
-        remove_hook_from_module(pipe.transformer_2, recurse=True)
+        if is_wan22:
+            remove_hook_from_module(pipe.transformer_2, recurse=True)
     except ImportError:
         warnings.warn("accelerate is not installed, hooks will not be removed")
 
