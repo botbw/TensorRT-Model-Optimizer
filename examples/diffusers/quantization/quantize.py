@@ -994,10 +994,9 @@ def main() -> None:
             calibrator.run_calibration(prompts)
 
         quantizer.quantize_model(backbone, backbone_quant_config, forward_loop)
+    export_manager.save_checkpoint(backbone)
     if args.quantized_hf_ckpt_save_path is not None:
         export_diffuser_checkpoint(pipe, torch.half, args.quantized_hf_ckpt_save_path, is_wan22=(model_config.model_type==ModelType.WAN and diffuser_version >= WAN22_VERSION))
-    else:
-        export_manager.save_checkpoint(backbone)
     export_manager.export_onnx(
         pipe,
         backbone,
