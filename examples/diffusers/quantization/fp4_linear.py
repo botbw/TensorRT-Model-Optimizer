@@ -4,7 +4,8 @@ from argparse import ArgumentParser
 from torch.nn import Parameter
 from typing import Optional, List
 from sgl_kernel import cutlass_scaled_fp4_mm, scaled_fp4_quant
-from diffusers import FluxPipeline
+from diffusers import FluxPipeline, WanPipeline
+from diffusers.utils import export_to_video
 from safetensors.torch import load_file
 
 class Fp4Linear(nn.Module):
@@ -187,18 +188,32 @@ def process_model_fp4_weights(model: nn.Module):
 
 def main():
     parser = ArgumentParser()
-    parser.add_argument("--transformer-state-dict", type=str, default="fp4/flux-fp4-max-1-sample-28-step/transformer/diffusion_pytorch_model.safetensors", help="Path to the pre-trained model.")
+    parser.add_argument("--model", type=str, choices=["wan", "flux"], default="flux")
     parser.add_argument("--group-size", type=int, default=16, help="Group size for FP4 quantization.")
     args = parser.parse_args()
-    pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-dev")
-    pipe = pipe.to("cuda")
-    replace_linear_with_fp4(pipe.transformer, args.group_size)
-    transformer_state_dict = load_file(args.transformer_state_dict)
-    pipe.transformer.load_state_dict(transformer_state_dict, strict=False)
-    process_model_fp4_weights(pipe.transformer)
-    prompt = "realistic car 3 d render sci - fi car and sci - fi robotic factory structure in the coronation of napoleon painting and digital billboard with point cloud in the middle, unreal engine 5, keyshot, octane, artstation trending, ultra high detail, ultra realistic, cinematic, 8 k, 1 6 k, in style of zaha hadid, in style of nanospace michael menzelincev, in style of lee souder, in plastic, dark atmosphere, tilt shift, depth of field"
-    image = pipe(prompt=prompt).images[0]
-    image.save("example.png")
+    if args.model == "flux":
+        pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-dev")
+        pipe = pipe.to("cuda")
+        replace_linear_with_fp4(pipe.transformer, args.group_size)
+        pipe.transformer.load_state_dict(load_file("fp4/flux-fp4-max-1-sample-28-step/transformer/diffusion_pytorch_model.safetensors"), strict=False)
+        process_model_fp4_weights(pipe.transformer)
+        prompt = "A beautiful anime girl with flowers around her."
+        image = pipe(prompt=prompt).images[0]
+        image.save("example.png")
+    elif args.model == "wan":
+        pipe = WanPipeline.from_pretrained("Wan-AI/Wan2.2-T2V-A14B-Diffusers")
+        pipe = pipe.to("cuda")
+        replace_linear_with_fp4(pipe.transformer, args.group_size)
+        pipe.transformer.load_state_dict(load_file("fp4/wan2.2-fp4-32-sample-50-step/transformer/diffusion_pytorch_model.safetensors"), strict=False)
+        process_model_fp4_weights(pipe.transformer)
+        replace_linear_with_fp4(pipe.transformer_2, args.group_size)
+        pipe.transformer_2.load_state_dict(load_file("fp4/wan2.2-fp4-32-sample-50-step/transformer_2/diffusion_pytorch_model.safetensors"), strict=False)
+        process_model_fp4_weights(pipe.transformer_2)
+        prompt = "A beautiful anime girl with flowers around her."
+        output = pipe(prompt).frames[0]
+        export_to_video(output, "example.mp4", fps=24)
+    else:
+        raise ValueError(f"Unsupported model: {args.model}")
 
 if __name__ == "__main__":
     main()
